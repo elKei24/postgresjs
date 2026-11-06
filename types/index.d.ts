@@ -461,6 +461,8 @@ declare namespace postgres {
       | 'COPY_IN_PROGRESS'
       | 'UNSAFE_TRANSACTION'
       | 'TRANSACTION_ROLLED_BACK'
+      | 'BATCH_SKIPPED'
+      | 'BATCH_UNSUPPORTED'
       | 'SSL_NOT_SUPPORTED'
       | 'CHANNEL_BINDING_REQUIRED'
       | 'PROTOCOL_ERROR'
@@ -912,7 +914,7 @@ declare namespace postgres {
     largeObject(oid?: number, /** @default 0x00020000 | 0x00040000 */ mode?: number): Promise<LargeObject>
 
     begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
-    begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
+    begin<T>(options: string | TransactionOptions, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
 
     /** A connection of your own until `release()` */
     reserve(): Promise<ReservedSql<TTypes>>
@@ -921,10 +923,20 @@ declare namespace postgres {
     [Symbol.asyncDispose](): Promise<void>
   }
 
+  interface TransactionOptions {
+    /** The transaction mode, sent after BEGIN, such as 'read only' or 'isolation level serializable' */
+    mode?: string | undefined
+    /**
+     * 'end': BEGIN, the queries and COMMIT share one Sync. A callback that returns queries is one round trip, and a failed query
+     * makes the server skip the ones behind it, which reject with BATCH_SKIPPED. 'query' (the default) gives each query its own Sync.
+     */
+    sync?: 'query' | 'end' | undefined
+  }
+
   interface TransactionSql<TTypes extends Record<string, unknown> = {}> extends ISql<TTypes> {
     /** A savepoint; a mode other than the transaction's throws NESTED_TRANSACTION_MODE */
     begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
-    begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
+    begin<T>(options: string | TransactionOptions, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
     savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
     savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>
 

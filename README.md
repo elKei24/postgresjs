@@ -804,6 +804,23 @@ await sql.begin(async sql => {
 })
 ```
 
+#### One round trip `await sql.begin({ sync: 'end' }, fn)`
+
+By default each query in a transaction ends with its own Sync, and `sql.begin` waits for the answer to `BEGIN` before it sends the first query, so a transaction costs at least three round trips: `BEGIN`, the queries and `COMMIT`. With `sync: 'end'`, `BEGIN`, the queries and `COMMIT` go out with one Sync at the end. A callback that returns a query, or an array of queries, is one round trip. `mode` gives the transaction mode.
+
+```js
+const [[user], [account]] = await sql.begin({ sync: 'end', mode: 'read write' }, sql => [
+  sql`insert into users ${ sql(user) } returning *`,
+  sql`insert into accounts ${ sql(account) } returning *`
+])
+```
+
+PostgreSQL skips everything up to the next Sync after an error, so a `BEGIN` the server refuses or cancels runs none of the queries, and a failed query stops the ones behind it before they run. The failed query rejects with the server's error, and so does `sql.begin`. The queries behind it reject with `BATCH_SKIPPED`, with the server's error as `cause`; the queries before it ran, but the transaction is rolled back. A callback that awaits its queries works too: each query is followed by a Flush, so its answer comes back, and only `COMMIT` or `ROLLBACK` carries the Sync.
+
+Savepoints and nested `sql.begin` work the same way. After a failed query inside a savepoint, `ROLLBACK TO` and the queries after it go out behind the Sync that the error made necessary. A new prepared statement that the server has to describe first costs one more round trip, as it does outside a transaction.
+
+Simple queries (`sql.unsafe` without parameters, `.simple()`, `sql.file`) use the extended protocol in such a transaction, so a string with more than one statement fails. `sql.batch`, cursors, streams and `.describe()` need a Sync of their own and reject with `BATCH_UNSUPPORTED`, which rolls the transaction back. As with any pipelined queries, a cancel request can reach the server after the query it was meant for has finished, and then cancels the query behind it; in such a transaction that rolls everything back.
+
 #### SAVEPOINT `await sql.savepoint([name], fn) -> fn()`
 
 ```js
@@ -1848,6 +1865,16 @@ The server offered no SASL mechanism Postgres.js supports (SCRAM-SHA-256 or, ove
 
 ##### SSL_NEGOTIATION_NOT_SUPPORTED
 `sslnegotiation: 'direct'` was asked for in Cloudflare Workers, which cannot do it.
+
+##### BATCH_SKIPPED
+> The query was not run, an earlier query in the transaction failed
+
+In a transaction with `sync: 'end'`, a query behind one that failed is not run by the server, and one made after the failure is not sent. The failed query's error is the `cause`.
+
+##### BATCH_UNSUPPORTED
+> A batch, cursor, stream or describe can not run in a transaction with sync: end
+
+Each of them needs a Sync of its own. The transaction is rolled back.
 
 ##### TRANSACTION_ROLLED_BACK
 > The server rolled back the transaction instead of committing it

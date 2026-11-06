@@ -78,6 +78,10 @@ export function Pool(options, types) {
     if (ending && !lease)
       return q.reject(queryError(Errors.connection('CONNECTION_ENDED', options, options.host[0], options.port[0]), q, options.debug))
 
+    const group = lease && lease.group
+    if (group && (q.parts || q.cursorFn || q.streaming || q.onlyDescribe))
+      return unbuilt(q, Errors.generic('BATCH_UNSUPPORTED', 'A batch, cursor, stream or describe can not run in a transaction with sync: end'), lease)
+
     if (q.parts)
       return batch(q, lease)
 
@@ -90,7 +94,7 @@ export function Pool(options, types) {
 
     const free = !lease && options.max !== 1
 
-    if (q.options.simple && !built.values.length) {
+    if (q.options.simple && !built.values.length && !group) {
       const known = (free || options.scheduler) && statements.known(built.text)
       q.alone = free && alone(known)
       options.scheduler && (q.cost = known)
@@ -171,8 +175,10 @@ export function Pool(options, types) {
     if (missing)
       return reject(job, missing)
 
-    if (job.q && job.q.cancelled)
-      return job.q.reject(queryError(Errors.generic('57014', 'canceling statement due to user request'), job.q, options.debug))
+    if (job.q && job.q.cancelled) {
+      const error = Errors.generic('57014', 'canceling statement due to user request')
+      return lease && lease.group ? unbuilt(job.q, error, lease) : job.q.reject(queryError(error, job.q, options.debug))
+    }
 
     if (lease) {
       return lease.connection.closed ? job.q.reject(queryError(lease.connection.closed, job.q, options.debug))

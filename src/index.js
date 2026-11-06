@@ -190,10 +190,12 @@ function Postgres(a, b) {
     return reserved
   }
 
-  function begin(mode, fn) {
-    !fn && (fn = mode, mode = '')
+  function begin(options, fn) {
+    !fn && (fn = options, options = '')
+    const { mode = '', sync } = settings(options)
+        , pipelined = sync === 'end'
     if (!active(channels.transaction))
-      return transaction(mode, fn, null)
+      return transaction(mode, fn, null, pipelined)
 
     const context = {
       mode,
@@ -205,7 +207,7 @@ function Postgres(a, b) {
       outcome: null
     }
     let promise
-    start(channels.transaction, context, () => promise = transaction(mode, fn, context))
+    start(channels.transaction, context, () => promise = transaction(mode, fn, context, pipelined))
 
     return promise.then(
       result => (finish(channels.transaction, context, null, result), result),
@@ -216,11 +218,12 @@ function Postgres(a, b) {
     )
   }
 
-  async function transaction(mode, fn, context) {
+  async function transaction(mode, fn, context, pipelined) {
     const lease = await pool.lease('transaction')
 
     let savepoints = 0
       , prepare = null
+      , opening = null
 
     context && Object.assign(context, {
       connection: lease.connection.id,
@@ -229,7 +232,10 @@ function Postgres(a, b) {
     })
 
     try {
-      await control(lease, 'begin ' + mode.replace(/[^a-z ]/ig, ''))
+      pipelined && (lease.group = { aborted: null })
+      opening = control(lease, 'begin ' + mode.replace(/[^a-z ]/ig, ''))
+      opening.catch(() => {})
+      pipelined || await opening
       const done = scope(fn)
       done.catch(() => {})
       return await Promise.race([done, lease.closed])
@@ -242,6 +248,7 @@ function Postgres(a, b) {
         , result
         , rolled = null
         , after = null
+        , committed = null
 
       if (above())
         throw rolledBack()
@@ -256,7 +263,7 @@ function Postgres(a, b) {
 
       scoped.savepoint = savepoint
       scoped.begin = nested
-      scoped.rollback = () => rolled || (rolled = control(lease, name ? 'rollback to ' + identifier(name) : 'rollback').then(() => {}))
+      scoped.rollback = () => rolled || (rolled = rollback(lease, name).then(() => {}))
       scoped.prepare = x => {
         if (inside)
           throw Errors.generic('NESTED_TRANSACTION_MODE', 'A nested transaction can not be prepared, only the outermost one')
@@ -267,6 +274,7 @@ function Postgres(a, b) {
       try {
         result = await new Promise((resolve, reject) => {
           const x = fn(scoped)
+          pipelined && !name && early(x)
           Promise.resolve(Array.isArray(x) ? Promise.all(x) : x).then(resolve, reject)
         })
         if (uncaught && !stopped())
@@ -274,11 +282,14 @@ function Postgres(a, b) {
         if (lease.connection.closed)
           throw lease.error || lease.connection.closed
       } catch (error) {
+        const refused = !name && await opening.then(() => null, e => e)
+        if (refused)
+          throw refused
         context && !name && (context.outcome = 'rollback')
         stopped()
           ? rolled && await rolled.catch(() => {})
-          : lease.connection.closed || await control(lease, name ? 'rollback to ' + identifier(name) : 'rollback')
-        throw error instanceof PostgresError && error.code === '25P02' && uncaught || error
+          : lease.connection.closed || await rollback(lease, name)
+        throw error && (error instanceof PostgresError && error.code === '25P02' || error.code === 'BATCH_SKIPPED') && uncaught || error
       }
 
       if (stopped()) {
@@ -292,7 +303,9 @@ function Postgres(a, b) {
       }
 
       if (!name) {
-        const done = await control(lease, prepare ? 'prepare transaction \'' + prepare.replace(/'/g, '\'\'') + '\'' : 'commit')
+        committed || (committed = commit()).catch(() => {})
+        await opening
+        const done = await committed
         context && (context.outcome = prepare ? 'prepare' : done.command === 'COMMIT' ? 'commit' : 'rollback')
 
         if (!prepare && done.command !== 'COMMIT')
@@ -300,6 +313,22 @@ function Postgres(a, b) {
       }
 
       return result
+
+      function commit() {
+        return control(lease, prepare ? 'prepare transaction \'' + prepare.replace(/'/g, '\'\'') + '\'' : 'commit')
+      }
+
+      // A callback that returns queries, and nothing that could make more, has made them all, so COMMIT
+      // goes out behind them in the same write; a failed query makes the server skip it.
+      function early(x) {
+        const queries = x instanceof Query ? [x] : Array.isArray(x) && x.every(q => q instanceof Query || !q || typeof q.then !== 'function') ? x : null
+        if (!queries || stopped())
+          return
+
+        queries.forEach(q => q instanceof Query && q.execute())
+        committed = commit()
+        committed.catch(() => {})
+      }
 
       function savepoint(name, fn) {
         if (name && Array.isArray(name.raw))
@@ -311,6 +340,7 @@ function Postgres(a, b) {
 
       async function nested(inner, fn) {
         !fn && (fn = inner, inner = '')
+        inner = settings(inner).mode || ''
 
         if (normal(inner) && normal(inner) !== normal(mode))
           throw Errors.generic('NESTED_TRANSACTION_MODE', 'A nested transaction runs in a savepoint, which can not change the transaction mode')
@@ -333,8 +363,23 @@ function Postgres(a, b) {
   }
 
   function control(lease, text) {
-    const q = new Query([text], [], Object.assign(q => lease.send(q), { options, cancel: pool.cancel }), { simple: true })
+    const q = new Query([text], [], Object.assign(q => lease.send(q), { options, cancel: pool.cancel }), { simple: true, prepare: false })
     return q.execute()
+  }
+
+  function settings(x) {
+    return typeof x === 'string' ? { mode: x } : x || {}
+  }
+
+  // After a failed query the group's Sync has gone out, so the rollback starts a new group behind it. A rollback
+  // sent before the failure was known is skipped with the rest of the group, and is sent again then.
+  function rollback(lease, name) {
+    const text = name ? 'rollback to ' + identifier(name) : 'rollback'
+    if (!lease.group)
+      return control(lease, text)
+
+    lease.group.aborted && (lease.group = { aborted: null })
+    return control(lease, text).catch(error => error.code === 'BATCH_SKIPPED' ? rollback(lease, name) : Promise.reject(error))
   }
 
   async function end(options) {

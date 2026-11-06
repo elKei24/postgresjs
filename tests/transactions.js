@@ -899,9 +899,15 @@ t('A savepoint or nested begin rejects when the connection is lost while its cal
 
 async function writes(fn) {
   let count = 0
+    , syncs = 0
   const server = net.createServer(client => {
     const upstream = net.connect(options.port || 5432, options.host || 'localhost')
-    client.on('data', x => (count++, upstream.write(x)))
+    client.on('data', x => {
+      count++
+      for (let i = 0; i < x.length; i += 1 + x.readInt32BE(i + 1))
+        x[i] === 83 && syncs++
+      upstream.write(x)
+    })
     upstream.on('data', x => client.write(x))
     client.on('close', () => upstream.destroy())
     upstream.on('close', () => client.destroy())
@@ -912,9 +918,9 @@ async function writes(fn) {
   const sql = postgres({ ...options, host: 'localhost', port: server.address().port, max: 1 })
   await sql`select ${ 1 }::int as x`
   try {
-    count = 0
+    count = syncs = 0
     const result = await fn(sql)
-    return count + ' ' + result
+    return count + ' ' + syncs + ' ' + result
   } finally {
     await sql.end()
     server.close()
@@ -922,12 +928,12 @@ async function writes(fn) {
 }
 
 t('begin waits for BEGIN before the first statement', async() => [
-  '3 1',
+  '3 1 1',
   await writes(sql => sql.begin(sql => sql`select ${ 1 }::int as x`).then(([x]) => x.x))
 ])
 
 t('begin with a transaction mode waits for BEGIN before the first statement', async() => [
-  '3 1',
+  '3 1 1',
   await writes(sql => sql.begin('read write', sql => sql`select ${ 1 }::int as x`).then(([x]) => x.x))
 ])
 
@@ -938,7 +944,11 @@ t('begin with a mode the server refuses runs none of the statements', async() =>
   return ['42601 0', error + ' ' + n, await sql`drop table test`]
 })
 
-t('A transaction whose BEGIN is canceled writes nothing', { timeout: 30 }, async() => {
+t('A transaction whose BEGIN is canceled writes nothing', { timeout: 30 }, () => canceled(''))
+
+t('A transaction with sync end whose BEGIN is canceled writes nothing', { timeout: 30 }, () => canceled({ sync: 'end' }))
+
+async function canceled(begin) {
   const victim = postgres({ ...options, max: 1, connection: { application_name: 'begin_cancel' } })
       , other = postgres({ ...options, max: 1 })
   await other`create table test (i int)`
@@ -950,7 +960,7 @@ t('A transaction whose BEGIN is canceled writes nothing', { timeout: 30 }, async
   let wrong = 0
     , canceled = 0
   for (let i = 0; i < 500; i++) {
-    const failed = await victim.begin(async sql => {
+    const failed = await victim.begin(begin, async sql => {
       await sql`insert into test values (${ i })`
       await sql`insert into test values (${ i })`
     }).then(() => false, e => e.code === '57014' || Promise.reject(e))
@@ -961,4 +971,157 @@ t('A transaction whose BEGIN is canceled writes nothing', { timeout: 30 }, async
   spraying.on = false
   await spray
   return ['0 true', wrong + ' ' + (canceled > 0), await other`drop table test`, await victim.end(), await other.end()]
+}
+
+t('begin with sync end sends BEGIN, the queries and COMMIT in one write with one Sync', async() => [
+  '1 1 3',
+  await writes(sql => sql.begin({ sync: 'end' }, sql => [sql`select ${ 1 }::int as x`, sql`select ${ 2 }::int as y`]).then(([[x], [y]]) => x.x + y.y))
+])
+
+t('begin with sync end and a single query is one write with one Sync', async() => [
+  '1 1 1',
+  await writes(sql => sql.begin({ sync: 'end' }, sql => sql`select ${ 1 }::int as x`).then(([x]) => x.x))
+])
+
+t('begin with sync end sends no Sync before COMMIT when the callback awaits its queries', async() => [
+  '3 1 2',
+  await writes(sql => sql.begin({ sync: 'end' }, async sql => {
+    const [a] = await sql`select ${ 1 }::int as x`
+    const [b] = await sql`select ${ a.x + 1 }::int as x`
+    return b.x
+  }))
+])
+
+t('begin with sync end describes a new statement with a Flush, then sends the rest in a second write', async() => [
+  '3 2 cold,warm',
+  await writes(async sql => [
+    await sql.begin({ sync: 'end' }, sql => sql`select ${ 'cold' }::text as x`).then(([x]) => x.x),
+    await sql.begin({ sync: 'end' }, sql => sql`select ${ 'warm' }::text as x`).then(([x]) => x.x)
+  ].join())
+])
+
+t('begin with sync end runs nothing after a failed query, and rolls back what ran before it', async() => {
+  await sql`create table test (x int)`
+  await sql`drop sequence if exists test_seq`
+  await sql`create sequence test_seq`
+  const queries = []
+  const error = await sql.begin({ sync: 'end' }, sql => {
+    queries.push(sql`insert into test values (1)`, sql`select 1/0`, sql`select nextval('test_seq')`, sql`insert into test values (2)`)
+    return queries
+  }).catch(e => e)
+  const outcomes = await Promise.all(queries.map(q => q.then(x => x.command, e => e.code + (e.cause ? '<' + e.cause.code : ''))))
+  const [{ n, called }] = await sql`select (select count(*) from test)::int as n, is_called as called from test_seq`
+  return [
+    '22012 INSERT,22012,BATCH_SKIPPED<22012,BATCH_SKIPPED<22012 0 false',
+    [error.code, outcomes.join(), n, called].join(' '),
+    await sql`drop table test`,
+    await sql`drop sequence test_seq`
+  ]
+})
+
+t('begin with sync end rejects a query made after a failed one with BATCH_SKIPPED', async() => {
+  let later
+  const error = await sql.begin({ sync: 'end' }, async sql => {
+    await sql`select 1/0`.catch(() => {})
+    later = await sql`select 1`.then(() => 'ran', e => e.code + '<' + e.cause.code)
+  }).catch(e => e.code)
+  return ['22012 BATCH_SKIPPED<22012', error + ' ' + later]
+})
+
+t('begin with sync end rolls back a thrown callback and keeps the connection', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  await sql`create table test (x int)`
+  const [{ pid }] = await sql`select pg_backend_pid() as pid`
+  const error = await sql.begin({ sync: 'end' }, async sql => {
+    sql`insert into test values (1)`
+    throw new Error('boom')
+  }).catch(e => e.message)
+  const [{ same, n }] = await sql`select pg_backend_pid() = ${ pid } as same, (select count(*) from test)::int as n`
+  return ['boom true 0', [error, same, n].join(' '), await sql`drop table test`, await sql.end()]
+})
+
+t('begin with sync end runs a savepoint, and goes on after one that failed', async() => {
+  await sql`create table test (x int)`
+  await sql.begin({ sync: 'end' }, async sql => {
+    await sql`insert into test values (1)`
+    await sql.savepoint(async sql => {
+      await sql`insert into test values (2)`
+      await sql`select 1/0`
+    }).catch(() => {})
+    await sql.begin(sql => sql`insert into test values (3)`)
+    await sql`insert into test values (4)`
+  })
+  const [{ xs }] = await sql`select string_agg(x::text, ',' order by x) as xs from test`
+  return ['1,3,4', xs, await sql`drop table test`]
+})
+
+t('begin with sync end and a mode the server refuses runs none of the statements, without a rollback', async() => {
+  const notices = []
+  const sql = postgres({ ...options, max: 1, onnotice: x => notices.push(x.message) })
+  await sql`create table test (x int)`
+  const error = await sql.begin({ mode: 'isolation level nonsense', sync: 'end' }, sql => sql`insert into test values (1)`).catch(e => e.code)
+  const [{ n }] = await sql`select count(*)::int as n from test`
+  return ['42601 0 ', [error, n, notices.join()].join(' '), await sql`drop table test`, await sql.end()]
+})
+
+t('Canceling a query in a transaction with sync end skips the ones behind it and rolls back', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  await sql`create table test (x int)`
+  let outcomes
+  const error = await sql.begin({ sync: 'end' }, async sql => {
+    const slow = sql`select pg_sleep(0.5)`
+        , next = sql`insert into test values (1)`
+    await delay(50)
+    await slow.cancel()
+    outcomes = await Promise.all([slow, next].map(q => q.then(() => 'ran', e => e.code)))
+  }).catch(e => e.code)
+  const [{ n }] = await sql`select count(*)::int as n from test`
+  return ['57014 57014,BATCH_SKIPPED 0', [error, outcomes.join(), n].join(' '), await sql`drop table test`, await sql.end()]
+})
+
+t('A query canceled before it is sent in a transaction with sync end skips the ones behind it', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  await sql`create table test (x int)`
+  const controller = new AbortController()
+  controller.abort()
+  const queries = []
+  const error = await sql.begin({ sync: 'end' }, sql => {
+    queries.push(sql`insert into test values (1)`, sql`insert into test values (2)`.signal(controller.signal), sql`insert into test values (3)`)
+    return queries
+  }).catch(e => e.code)
+  const outcomes = await Promise.all(queries.map(q => q.then(x => x.command, e => e.code)))
+  const [{ n }] = await sql`select count(*)::int as n from test`
+  return ['57014 INSERT,57014,BATCH_SKIPPED 0', [error, outcomes.join(), n].join(' '), await sql`drop table test`, await sql.end()]
+})
+
+t('begin with sync end runs a simple query through the extended protocol, and a nested begin in a savepoint', async() => [
+  '7 1',
+  await sql.begin({ sync: 'end' }, async sql => {
+    const [{ x }] = await sql.unsafe('select 7 as x')
+    const [{ y }] = await sql.begin({ sync: 'end' }, sql => sql`select 1 as y`)
+    return x + ' ' + y
+  })
+])
+
+t('A batch, cursor or stream in a transaction with sync end rejects with BATCH_UNSUPPORTED and commits nothing', async() => {
+  await sql`create table test (x int)`
+  const errors = []
+  for (const unsupported of [sql => sql.batch([sql`select 1`]), sql => sql`select 1`.cursor(1, () => {}), sql => sql`copy test to stdout`.readable()])
+    errors.push(await sql.begin({ sync: 'end' }, sql => [sql`insert into test values (1)`, unsupported(sql)]).catch(e => e.code))
+  const [{ n }] = await sql`select count(*)::int as n from test`
+  return ['BATCH_UNSUPPORTED,BATCH_UNSUPPORTED,BATCH_UNSUPPORTED 0', errors.join() + ' ' + n, await sql`drop table test`]
+})
+
+t('sql.rollback() and sql.prepare() work with sync end', async() => {
+  await sql`create table test (x int)`
+  const result = await sql.begin({ sync: 'end' }, async sql => {
+    await sql`insert into test values (1)`
+    await sql.rollback()
+    return 'value'
+  })
+  await sql.begin({ sync: 'end' }, sql => (sql.prepare('tx_sync_end'), sql`insert into test values (2)`))
+  const [{ before }] = await sql`select count(*)::int as before from test`
+  await sql`commit prepared 'tx_sync_end'`
+  const [{ after }] = await sql`select count(*)::int as after from test`
+  return ['value 0 1', [result, before, after].join(' '), await sql`drop table test`]
 })

@@ -79,6 +79,9 @@ export function Writer(size = 16384) {
       i = n
       return w
     },
+    last() {
+      return b[at]
+    },
     take() {
       const out = i < 4096 ? Buffer.from(b.subarray(0, i)) : b.subarray(0, i)
       i >= 4096 && (b = Buffer.allocUnsafe(size))

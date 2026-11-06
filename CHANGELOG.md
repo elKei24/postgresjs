@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **`sql.begin({ sync: 'end' }, fn)`** (#1269). `BEGIN`, the queries and `COMMIT` share one Sync, so a callback that returns a query or an array of queries is one round trip instead of three. The server skips everything up to the Sync after an error, so a `BEGIN` it refuses or cancels runs none of the queries, and a failed query stops the ones behind it, which reject with `BATCH_SKIPPED`. The transaction mode goes in `mode`. `sql.batch`, cursors, streams and `.describe()` reject with `BATCH_UNSUPPORTED` in such a transaction. Without the option nothing changes.
+
 ## v4.1.0 - 5 November 2026
 
 ### New

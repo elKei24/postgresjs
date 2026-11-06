@@ -47,6 +47,7 @@ export function Connection(ready, options, events) {
     , closed = null
     , closing = null
     , portals = 0
+    , unflushed = false
     , traced = 0
     , epoch = 0
     , headSince = 0
@@ -109,6 +110,8 @@ export function Connection(ready, options, events) {
     if (closed)
       return (out.take(), true)
 
+    // A write that ends in a transaction's part without a Sync gets one Flush, so the server answers it
+    unflushed && (unflushed = false, out.last() === 83 || out.last() === 72 || p.flush(out))
     return out.length ? socket.write(out.take()) : true
   }
 
@@ -249,8 +252,31 @@ export function Connection(ready, options, events) {
 
     x.statement = statement
     x.ends = statement.ends === undefined ? (statement.ends = ending.test(statement.text)) : statement.ends
+    if (!join(x))
+      return
     options.scheduler && cost(x)
     queue(x)
+  }
+
+  // A transaction with sync: 'end' keeps a group on its lease: a batch that grows as queries are made, with no
+  // query of its own. Its parts carry no Sync until COMMIT or ROLLBACK, so a failed one makes the server skip the rest.
+  function join(x) {
+    const b = x.lease && x.lease.group
+    if (!b)
+      return true
+
+    if (b.aborted)
+      return (settleError(x, skippedBy(b.aborted)), false)
+
+    x.batch = b
+    x.nosync = !x.ends
+    return true
+  }
+
+  function skippedBy(error) {
+    const x = Errors.generic('BATCH_SKIPPED', 'The query was not run, an earlier query in the transaction failed')
+    x.cause = error
+    return x
   }
 
   function batch(query, parts) {
@@ -334,6 +360,8 @@ export function Connection(ready, options, events) {
         , error = x.own || x.error
 
     b.aborted = error
+    // The failing query rejects before the skipped ones, so Promise.all and the transaction see its error first
+    b.query || settleError(x, error)
     let synced = !x.nosync && x.synced
     const at = sent.indexOf(x)
     for (let i = at === -1 ? sent.length : at + 1; i < sent.length;) {
@@ -363,7 +391,8 @@ export function Connection(ready, options, events) {
       y.done = true
       y.trace && traced--
       y.cost >= notable && notables--
-      settleError(y, skipped(error, b.parts.indexOf(y.query)))
+      y.cancel && y.cancel.resolve()
+      settleError(y, b.query ? skipped(error, b.parts.indexOf(y.query)) : skippedBy(error))
     }
   }
 
@@ -526,7 +555,7 @@ export function Connection(ready, options, events) {
     const mark = out.length
     try {
       x.nosync
-        ? (p.bind(out, x.portal, name, x.values, undefined, x.formats || undefined), p.execute(out, x.portal, x.rows))
+        ? (p.bind(out, x.portal, name, x.values, undefined, x.formats || undefined), p.execute(out, x.portal, x.rows), x.batch.query || (unflushed = true))
         : p.run(out, x.portal, name, x.values, x.rows, x.flushing, x.formats)
     } catch (error) {
       out.truncate(mark)
@@ -649,7 +678,8 @@ export function Connection(ready, options, events) {
   }
 
   function local(query, error) {
-    queue(Exchange('query', query, connection.lease, () => { throw error }))
+    const x = Exchange('query', query, connection.lease, () => { throw error })
+    join(x) && queue(x)
   }
 
   function cancel(query) {
@@ -667,7 +697,10 @@ export function Connection(ready, options, events) {
     const i = pending.findIndex(x => x.query === query || x.for === query)
 
     if (i !== -1) {
-      const [x] = pending.splice(i, 1)
+      const x = pending[i]
+      if (x.batch)
+        return (unwritten(x), Promise.resolve())
+      pending.splice(i, 1)
       x === fence && (fence = null)
       x.cost >= notable && notables--
       settleError(x, Errors.generic('57014', 'canceling statement due to user request'))
@@ -738,7 +771,7 @@ export function Connection(ready, options, events) {
 
   function unanswered(x) {
     x.unanswered = null
-    const query = x.batch ? x.batch.query : x.query || x.for
+    const query = x.batch && x.batch.query || x.query || x.for
     if (closed || (x.done && !x.batch) || !query || query.settled)
       return
 
@@ -751,7 +784,7 @@ export function Connection(ready, options, events) {
 
   function answered(x) {
     x.silence && (timers.clearTimeout(x.silence), x.silence = null)
-    x.unanswered && (!x.batch || x.batch.query.settled) && (timers.clearTimeout(x.unanswered), x.unanswered = null)
+    x.unanswered && (!x.batch || !x.batch.query || x.batch.query.settled) && (timers.clearTimeout(x.unanswered), x.unanswered = null)
   }
 
   function cancelBatch(query) {
@@ -760,11 +793,13 @@ export function Connection(ready, options, events) {
       return x === sent[0] ? cancelling(x) : new Promise((resolve, reject) => x.cancel = { resolve, reject })
 
     const first = pending.find(x => x.batch && x.batch.query === query)
-    if (first) {
-      first.own = Errors.generic('57014', 'canceling statement due to user request')
-      first.write = () => { throw first.own }
-    }
+    first && unwritten(first)
     return Promise.resolve()
+  }
+
+  function unwritten(x) {
+    x.own = Errors.generic('57014', 'canceling statement due to user request')
+    x.write = () => { throw x.own }
   }
 
   function close() {
